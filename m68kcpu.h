@@ -169,6 +169,22 @@ typedef uint32 uint64;
 #define EXCEPTION_INTERRUPT_AUTOVECTOR    24
 #define EXCEPTION_TRAP_BASE               32
 
+/* Bits in the 68010 format $8 special status word */
+#define SSW_RR                        0x8000 /* rerun: 0 = processor, 1 = software */
+#define SSW_IF                        0x2000 /* instruction fetch */
+#define SSW_DF                        0x1000 /* data fetch to data input buffer */
+#define SSW_RM                        0x0800 /* read-modify-write cycle */
+#define SSW_HB                        0x0400 /* high byte transfer (valid if BY) */
+#define SSW_BY                        0x0200 /* 1 = byte transfer, 0 = word */
+#define SSW_RW                        0x0100 /* 0 = write, 1 = read */
+#define SSW_FC                        0x0007 /* function code */
+
+/* Bus cycles a single instruction may have satisfied from software during a
+ * 68010 software rerun. Two covers the worst real case (a long transfer split
+ * into two word cycles, each faulted and supplied separately).
+ */
+#define M68K_RERUN_ENTRIES               4
+
 /* Function codes set by CPU during data/address bus activity */
 #define FUNCTION_CODE_USER_DATA          1
 #define FUNCTION_CODE_USER_PROGRAM       2
@@ -1014,6 +1030,36 @@ typedef struct
 	void (*set_fc_callback)(unsigned int new_fc);     /* Called when the CPU function code changes */
 	void (*instr_hook_callback)(unsigned int pc);     /* Called every instruction cycle prior to execution */
 
+	/* Bus cycle in progress, snapshotted on a bus error to fill in the
+	 * 68010 format $8 stack frame.
+	 */
+	uint access_address;
+	uint access_fc;
+	uint access_size;                 /* bytes: 1, 2 or 4 */
+	uint access_write;                /* 1 = write cycle, 0 = read cycle */
+	uint access_data;                 /* data being written (write cycles) */
+
+	uint berr_address;                /* snapshot taken at fault time */
+	uint berr_fc;
+	uint berr_size;
+	uint berr_write;
+	uint berr_data;
+	uint berr_address_override;       /* set by m68k_set_bus_error_address() */
+
+	/* Bus cycles an exception handler ran on our behalf (SSW.RR set on RTE).
+	 * Musashi restarts the faulted instruction rather than resuming it, so
+	 * the supplied data is replayed when the access recurs. Entries belong
+	 * to one instruction.
+	 */
+	uint rerun_pc;
+	uint rerun_count;
+	struct {
+		uint address;
+		uint size;                    /* bytes: 1 or 2 */
+		uint data;
+		uint write;
+	} rerun[M68K_RERUN_ENTRIES];
+
 } m68ki_cpu_core;
 
 
@@ -1138,8 +1184,92 @@ static inline uint m68ki_read_imm_32(void)
  * These functions will also check for address error and set the function
  * code if they are enabled in m68kconf.h.
  */
+/* Record the bus cycle about to run, in case it faults.
+ */
+static inline void m68ki_set_access(uint address, uint fc, uint size, uint write, uint data)
+{
+	m68ki_cpu.access_address = address;
+	m68ki_cpu.access_fc      = fc;
+	m68ki_cpu.access_size    = size;
+	m68ki_cpu.access_write   = write;
+	m68ki_cpu.access_data    = data;
+}
+
+/* Drop rerun data once we move past the instruction it was supplied for.
+ */
+static inline void m68ki_rerun_expire(void)
+{
+	if(m68ki_cpu.rerun_count != 0 && REG_PPC != m68ki_cpu.rerun_pc)
+		m68ki_cpu.rerun_count = 0;
+}
+
+/* Record a bus cycle an exception handler ran for us.
+ */
+static inline void m68ki_rerun_supply(uint pc, uint ssw, uint address, uint dib)
+{
+	uint size = (ssw & SSW_BY) ? 1 : 2;
+	uint data = dib;
+
+	if(size == 1)
+		data = (ssw & SSW_HB) ? ((dib >> 8) & 0xff) : (dib & 0xff);
+
+	if(m68ki_cpu.rerun_count != 0 && m68ki_cpu.rerun_pc != pc)
+		m68ki_cpu.rerun_count = 0;
+	m68ki_cpu.rerun_pc = pc;
+
+	/* On overflow the oldest cycle runs for real again and faults afresh */
+	if(m68ki_cpu.rerun_count == M68K_RERUN_ENTRIES)
+	{
+		uint i;
+		for(i = 1; i < M68K_RERUN_ENTRIES; i++)
+			m68ki_cpu.rerun[i-1] = m68ki_cpu.rerun[i];
+		m68ki_cpu.rerun_count--;
+	}
+
+	m68ki_cpu.rerun[m68ki_cpu.rerun_count].address = address;
+	m68ki_cpu.rerun[m68ki_cpu.rerun_count].size    = size;
+	m68ki_cpu.rerun[m68ki_cpu.rerun_count].data    = data;
+	m68ki_cpu.rerun[m68ki_cpu.rerun_count].write   = (ssw & SSW_RW) ? 0 : 1;
+	m68ki_cpu.rerun_count++;
+}
+
+/* Returns 1 and fills *data if this cycle was already run in software.
+ */
+static inline int m68ki_rerun_match(uint address, uint size, uint write, uint* data)
+{
+	uint i;
+
+	for(i = 0; i < m68ki_cpu.rerun_count; i++)
+	{
+		if(m68ki_cpu.rerun[i].address == address &&
+		   m68ki_cpu.rerun[i].size    == size    &&
+		   m68ki_cpu.rerun[i].write   == write)
+		{
+			*data = m68ki_cpu.rerun[i].data;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* One word bus cycle, after address translation. Separate so a long transfer
+ * can be run as the two word cycles the 68010 would use.
+ */
+static inline uint m68ki_read_word_cycle(uint address, uint fc)
+{
+	uint data;
+
+	if(m68ki_rerun_match(address, 2, 0, &data))
+		return data;
+
+	m68ki_set_access(address, fc, 2, 0, 0);
+	return m68k_read_memory_16(ADDRESS_68K(address));
+}
+
 static inline uint m68ki_read_8_fc(uint address, uint fc)
 {
+	uint data;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 
@@ -1148,10 +1278,16 @@ static inline uint m68ki_read_8_fc(uint address, uint fc)
 	    address = pmmu_translate_addr(address);
 #endif
 
+	if(m68ki_rerun_match(address, 1, 0, &data))
+		return data;
+
+	m68ki_set_access(address, fc, 1, 0, 0);
 	return m68k_read_memory_8(ADDRESS_68K(address));
 }
 static inline uint m68ki_read_16_fc(uint address, uint fc)
 {
+	uint data;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error_010_less(address, MODE_READ, fc); /* auto-disable (see m68kcpu.h) */
@@ -1161,10 +1297,13 @@ static inline uint m68ki_read_16_fc(uint address, uint fc)
 	    address = pmmu_translate_addr(address);
 #endif
 
-	return m68k_read_memory_16(ADDRESS_68K(address));
+	(void)data;
+	return m68ki_read_word_cycle(address, fc);
 }
 static inline uint m68ki_read_32_fc(uint address, uint fc)
 {
+	uint data;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error_010_less(address, MODE_READ, fc); /* auto-disable (see m68kcpu.h) */
@@ -1174,11 +1313,23 @@ static inline uint m68ki_read_32_fc(uint address, uint fc)
 	    address = pmmu_translate_addr(address);
 #endif
 
+	/* Two word cycles, so software can only have supplied one half. Split
+	 * the transfer when it has, letting the other half fault normally.
+	 */
+	if(m68ki_cpu.rerun_count != 0 &&
+	   (m68ki_rerun_match(address, 2, 0, &data) ||
+	    m68ki_rerun_match(address + 2, 2, 0, &data)))
+		return (m68ki_read_word_cycle(address, fc) << 16) |
+		        m68ki_read_word_cycle(address + 2, fc);
+
+	m68ki_set_access(address, fc, 4, 0, 0);
 	return m68k_read_memory_32(ADDRESS_68K(address));
 }
 
 static inline void m68ki_write_8_fc(uint address, uint fc, uint value)
 {
+	uint supplied;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 
@@ -1187,10 +1338,16 @@ static inline void m68ki_write_8_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
+	if(m68ki_rerun_match(address, 1, 1, &supplied))
+		return;                       /* software already ran this cycle */
+
+	m68ki_set_access(address, fc, 1, 1, value);
 	m68k_write_memory_8(ADDRESS_68K(address), value);
 }
 static inline void m68ki_write_16_fc(uint address, uint fc, uint value)
 {
+	uint supplied;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error_010_less(address, MODE_WRITE, fc); /* auto-disable (see m68kcpu.h) */
@@ -1200,10 +1357,16 @@ static inline void m68ki_write_16_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
+	if(m68ki_rerun_match(address, 2, 1, &supplied))
+		return;                       /* software already ran this cycle */
+
+	m68ki_set_access(address, fc, 2, 1, value);
 	m68k_write_memory_16(ADDRESS_68K(address), value);
 }
 static inline void m68ki_write_32_fc(uint address, uint fc, uint value)
 {
+	uint supplied;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error_010_less(address, MODE_WRITE, fc); /* auto-disable (see m68kcpu.h) */
@@ -1213,12 +1376,18 @@ static inline void m68ki_write_32_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
+	if(m68ki_rerun_match(address, 4, 1, &supplied))
+		return;                       /* software already ran this cycle */
+
+	m68ki_set_access(address, fc, 4, 1, value);
 	m68k_write_memory_32(ADDRESS_68K(address), value);
 }
 
 #if M68K_SIMULATE_PD_WRITES
 static inline void m68ki_write_32_pd_fc(uint address, uint fc, uint value)
 {
+	uint supplied;
+
 	(void)fc;
 	m68ki_set_fc(fc); /* auto-disable (see m68kcpu.h) */
 	m68ki_check_address_error_010_less(address, MODE_WRITE, fc); /* auto-disable (see m68kcpu.h) */
@@ -1228,6 +1397,10 @@ static inline void m68ki_write_32_pd_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
+	if(m68ki_rerun_match(address, 4, 1, &supplied))
+		return;                       /* software already ran this cycle */
+
+	m68ki_set_access(address, fc, 4, 1, value);
 	m68k_write_memory_32_pd(ADDRESS_68K(address), value);
 }
 #endif
@@ -1678,6 +1851,25 @@ static inline void m68ki_stack_frame_buserr(uint sr)
  */
 static inline void m68ki_stack_frame_1000(uint pc, uint sr, uint vector)
 {
+	/* Captured before the pushes below overwrite the access state. */
+	uint fault_address = m68ki_cpu.berr_address;
+	uint ssw = m68ki_cpu.berr_fc & SSW_FC;
+
+	if(m68ki_cpu.berr_write == 0)
+		ssw |= SSW_RW;
+	if((m68ki_cpu.berr_fc & 3) == FUNCTION_CODE_USER_PROGRAM)
+		ssw |= SSW_IF;
+	else
+		ssw |= SSW_DF;
+	if(m68ki_cpu.berr_size == 1)
+	{
+		ssw |= SSW_BY;
+		/* Byte cycles use the high half of the data bus at even addresses. */
+		if(!(fault_address & 1))
+			ssw |= SSW_HB;
+	}
+	/* SSW_RM (read-modify-write) is not modelled. */
+
 	/* VERSION
 	 * NUMBER
 	 * INTERNAL INFORMATION, 16 WORDS
@@ -1691,7 +1883,7 @@ static inline void m68ki_stack_frame_1000(uint pc, uint sr, uint vector)
 	m68ki_fake_push_32();
 	m68ki_fake_push_32();
 
-	/* INSTRUCTION INPUT BUFFER */
+	/* INSTRUCTION INPUT BUFFER -- not modelled */
 	m68ki_push_16(0);
 
 	/* UNUSED, RESERVED (not written) */
@@ -1704,16 +1896,16 @@ static inline void m68ki_stack_frame_1000(uint pc, uint sr, uint vector)
 	m68ki_fake_push_16();
 
 	/* DATA OUTPUT BUFFER */
-	m68ki_push_16(0);
+	m68ki_push_16(m68ki_cpu.berr_write ? m68ki_cpu.berr_data : 0);
 
 	/* UNUSED, RESERVED (not written) */
 	m68ki_fake_push_16();
 
 	/* FAULT ADDRESS */
-	m68ki_push_32(0);
+	m68ki_push_32(fault_address);
 
 	/* SPECIAL STATUS WORD */
-	m68ki_push_16(0);
+	m68ki_push_16(ssw);
 
 	/* 1000, VECTOR OFFSET */
 	m68ki_push_16(0x8000 | (vector<<2));
@@ -1937,6 +2129,16 @@ extern jmp_buf m68ki_bus_error_jmp_buf;
 static inline void m68ki_exception_bus_error(void)
 {
 	int i;
+
+	/* Snapshot the faulted cycle before the frame pushes overwrite it */
+	m68ki_cpu.berr_address = m68ki_cpu.berr_address_override != 0xFFFFFFFF
+	                       ? m68ki_cpu.berr_address_override
+	                       : m68ki_cpu.access_address;
+	m68ki_cpu.berr_fc      = m68ki_cpu.access_fc;
+	m68ki_cpu.berr_size    = m68ki_cpu.access_size;
+	m68ki_cpu.berr_write   = m68ki_cpu.access_write;
+	m68ki_cpu.berr_data    = m68ki_cpu.access_data;
+	m68ki_cpu.berr_address_override = 0xFFFFFFFF;
 
 	/* If we were processing a bus error, address error, or reset,
 	 * while writing the stack frame, this is a catastrophic failure.

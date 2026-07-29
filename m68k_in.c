@@ -9230,13 +9230,17 @@ M68KMAKE_OP(rte, 32, ., .)
 				/* Format 8 stack frame -- 68010 only. 29 word bus/address error */
 				new_sr = m68ki_pull_16();
 				new_pc = m68ki_pull_32();
+				uint ssw;
+				uint fault_address;
+				uint dib;
+
 				m68ki_fake_pull_16();	/* format word */
-				m68ki_fake_pull_16();	/* special status word */
-				m68ki_fake_pull_32();	/* fault address */
+				ssw = m68ki_pull_16();	/* special status word */
+				fault_address = m68ki_pull_32();	/* fault address */
 				m68ki_fake_pull_16();	/* unused/reserved */
 				m68ki_fake_pull_16();	/* data output buffer */
 				m68ki_fake_pull_16();	/* unused/reserved */
-				m68ki_fake_pull_16();	/* data input buffer */
+				dib = m68ki_pull_16();	/* data input buffer */
 				m68ki_fake_pull_16();	/* unused/reserved */
 				m68ki_fake_pull_16();	/* instruction input buffer */
 				m68ki_fake_pull_32();	/* internal information, 16 words */
@@ -9247,6 +9251,13 @@ M68KMAKE_OP(rte, 32, ., .)
 				m68ki_fake_pull_32();
 				m68ki_fake_pull_32();
 				m68ki_fake_pull_32();
+
+				/* RR set: the handler ran the cycle itself, so resume from
+				 * the data input buffer rather than repeating the access.
+				 */
+				if(ssw & SSW_RR)
+					m68ki_rerun_supply(new_pc, ssw, fault_address, dib);
+
 				m68ki_jump(new_pc);
 				m68ki_set_sr(new_sr);
 				CPU_INSTR_MODE = INSTRUCTION_YES;

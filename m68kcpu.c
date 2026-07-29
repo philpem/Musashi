@@ -997,6 +997,9 @@ int m68k_execute(int num_cycles)
 			/* Record previous program counter */
 			REG_PPC = REG_PC;
 
+			/* Drop rerun data once we move past its instruction */
+			m68ki_rerun_expire();
+
 			/* Record previous D/A register state (in case of bus error) */
 			for (i = 15; i >= 0; i--){
 				REG_DA_SAVE[i] = REG_DA[i];
@@ -1114,11 +1117,24 @@ void m68k_pulse_bus_error(void)
 	m68ki_exception_bus_error();
 }
 
+/* Override the fault address for the next bus error, for hosts whose own
+ * checking is finer grained than the memory interface (one that checks the two
+ * word cycles of a long transfer separately, say). Applies to one bus error.
+ */
+void m68k_set_bus_error_address(unsigned int address)
+{
+	m68ki_cpu.berr_address_override = address;
+}
+
 /* Pulse the RESET line on the CPU */
 void m68k_pulse_reset(void)
 {
 	/* Disable the PMMU on reset */
 	m68ki_cpu.pmmu_enabled = 0;
+
+	/* Nothing outstanding, nothing supplied by software */
+	m68ki_cpu.berr_address_override = 0xFFFFFFFF;
+	m68ki_cpu.rerun_count = 0;
 
 	/* Clear all stop levels and eat up all remaining cycles */
 	CPU_STOPPED = 0;

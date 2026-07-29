@@ -359,6 +359,11 @@ void m68k_pulse_halt(void);
 /* Trigger a bus error exception */
 void m68k_pulse_bus_error(void);
 
+/* Override the fault address reported by the next bus error. Call immediately
+ * before m68k_pulse_bus_error(); applies to that bus error only.
+ */
+void m68k_set_bus_error_address(unsigned int address);
+
 
 /* Context switching to allow multiple CPUs */
 
