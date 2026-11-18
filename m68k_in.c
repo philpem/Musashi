@@ -9256,7 +9256,7 @@ M68KMAKE_OP(rte, 32, ., .)
 				 * the data input buffer rather than repeating the access.
 				 */
 				if(ssw & SSW_RR)
-					m68ki_rerun_supply(new_pc, ssw, fault_address, dib);
+					m68ki_rerun_supply(new_pc, new_sr, ssw, fault_address, dib);
 
 				m68ki_jump(new_pc);
 				m68ki_set_sr(new_sr);

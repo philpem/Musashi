@@ -1010,6 +1010,9 @@ int m68k_execute(int num_cycles)
 			m68ki_instruction_jump_table[REG_IR]();
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
 
+			/* A restarted instruction that got here has used its rerun data */
+			m68ki_rerun_done();
+
 			/* Trace m68k_exception, if necessary */
 			m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
 		} while(GET_CYCLES() > 0);
