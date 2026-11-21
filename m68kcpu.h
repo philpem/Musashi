@@ -1049,15 +1049,17 @@ typedef struct
 	/* Bus cycles an exception handler ran on our behalf (SSW.RR set on RTE).
 	 * Musashi restarts the faulted instruction rather than resuming it, so
 	 * the supplied data is replayed when the access recurs. Entries belong
-	 * to one instruction.
+	 * to one instruction, and only match cycles with the same function code.
 	 */
 	uint rerun_pc;
+	uint rerun_super;                 /* the instruction ran in supervisor mode */
 	uint rerun_count;
 	struct {
 		uint address;
 		uint size;                    /* bytes: 1 or 2 */
 		uint data;
 		uint write;
+		uint fc;
 	} rerun[M68K_RERUN_ENTRIES];
 
 } m68ki_cpu_core;
@@ -1196,26 +1198,43 @@ static inline void m68ki_set_access(uint address, uint fc, uint size, uint write
 }
 
 /* Drop rerun data once we move past the instruction it was supplied for.
+ * Only code in that instruction's own mode moves past it. The exception
+ * handlers (and interrupts) that run before a user instruction is restarted
+ * are in supervisor mode, and must not drop what an earlier fault of the same
+ * instruction supplied: a long read whose two word cycles both fault needs
+ * both halves at once.
  */
 static inline void m68ki_rerun_expire(void)
 {
-	if(m68ki_cpu.rerun_count != 0 && REG_PPC != m68ki_cpu.rerun_pc)
+	if(m68ki_cpu.rerun_count != 0 && REG_PPC != m68ki_cpu.rerun_pc &&
+	   (FLAG_S ? 1 : 0) == m68ki_cpu.rerun_super)
+		m68ki_cpu.rerun_count = 0;
+}
+
+/* The restarted instruction has finished, so its supplied cycles are used up.
+ */
+static inline void m68ki_rerun_done(void)
+{
+	if(m68ki_cpu.rerun_count != 0 && REG_PPC == m68ki_cpu.rerun_pc)
 		m68ki_cpu.rerun_count = 0;
 }
 
 /* Record a bus cycle an exception handler ran for us.
  */
-static inline void m68ki_rerun_supply(uint pc, uint ssw, uint address, uint dib)
+static inline void m68ki_rerun_supply(uint pc, uint sr, uint ssw, uint address, uint dib)
 {
 	uint size = (ssw & SSW_BY) ? 1 : 2;
 	uint data = dib;
+	uint super = (sr & 0x2000) ? 1 : 0;
 
 	if(size == 1)
 		data = (ssw & SSW_HB) ? ((dib >> 8) & 0xff) : (dib & 0xff);
 
-	if(m68ki_cpu.rerun_count != 0 && m68ki_cpu.rerun_pc != pc)
+	if(m68ki_cpu.rerun_count != 0 &&
+	   (m68ki_cpu.rerun_pc != pc || m68ki_cpu.rerun_super != super))
 		m68ki_cpu.rerun_count = 0;
 	m68ki_cpu.rerun_pc = pc;
+	m68ki_cpu.rerun_super = super;
 
 	/* On overflow the oldest cycle runs for real again and faults afresh */
 	if(m68ki_cpu.rerun_count == M68K_RERUN_ENTRIES)
@@ -1230,12 +1249,15 @@ static inline void m68ki_rerun_supply(uint pc, uint ssw, uint address, uint dib)
 	m68ki_cpu.rerun[m68ki_cpu.rerun_count].size    = size;
 	m68ki_cpu.rerun[m68ki_cpu.rerun_count].data    = data;
 	m68ki_cpu.rerun[m68ki_cpu.rerun_count].write   = (ssw & SSW_RW) ? 0 : 1;
+	m68ki_cpu.rerun[m68ki_cpu.rerun_count].fc      = ssw & SSW_FC;
 	m68ki_cpu.rerun_count++;
 }
 
 /* Returns 1 and fills *data if this cycle was already run in software.
+ * The function code must match too: a user cycle supplied at a low address
+ * must not answer a supervisor read there, such as an interrupt vector fetch.
  */
-static inline int m68ki_rerun_match(uint address, uint size, uint write, uint* data)
+static inline int m68ki_rerun_match(uint address, uint size, uint write, uint fc, uint* data)
 {
 	uint i;
 
@@ -1243,7 +1265,8 @@ static inline int m68ki_rerun_match(uint address, uint size, uint write, uint* d
 	{
 		if(m68ki_cpu.rerun[i].address == address &&
 		   m68ki_cpu.rerun[i].size    == size    &&
-		   m68ki_cpu.rerun[i].write   == write)
+		   m68ki_cpu.rerun[i].write   == write   &&
+		   m68ki_cpu.rerun[i].fc      == (fc & SSW_FC))
 		{
 			*data = m68ki_cpu.rerun[i].data;
 			return 1;
@@ -1259,7 +1282,7 @@ static inline uint m68ki_read_word_cycle(uint address, uint fc)
 {
 	uint data;
 
-	if(m68ki_rerun_match(address, 2, 0, &data))
+	if(m68ki_rerun_match(address, 2, 0, fc, &data))
 		return data;
 
 	m68ki_set_access(address, fc, 2, 0, 0);
@@ -1278,7 +1301,7 @@ static inline uint m68ki_read_8_fc(uint address, uint fc)
 	    address = pmmu_translate_addr(address);
 #endif
 
-	if(m68ki_rerun_match(address, 1, 0, &data))
+	if(m68ki_rerun_match(address, 1, 0, fc, &data))
 		return data;
 
 	m68ki_set_access(address, fc, 1, 0, 0);
@@ -1317,8 +1340,8 @@ static inline uint m68ki_read_32_fc(uint address, uint fc)
 	 * the transfer when it has, letting the other half fault normally.
 	 */
 	if(m68ki_cpu.rerun_count != 0 &&
-	   (m68ki_rerun_match(address, 2, 0, &data) ||
-	    m68ki_rerun_match(address + 2, 2, 0, &data)))
+	   (m68ki_rerun_match(address, 2, 0, fc, &data) ||
+	    m68ki_rerun_match(address + 2, 2, 0, fc, &data)))
 		return (m68ki_read_word_cycle(address, fc) << 16) |
 		        m68ki_read_word_cycle(address + 2, fc);
 
@@ -1338,7 +1361,7 @@ static inline void m68ki_write_8_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
-	if(m68ki_rerun_match(address, 1, 1, &supplied))
+	if(m68ki_rerun_match(address, 1, 1, fc, &supplied))
 		return;                       /* software already ran this cycle */
 
 	m68ki_set_access(address, fc, 1, 1, value);
@@ -1357,7 +1380,7 @@ static inline void m68ki_write_16_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
-	if(m68ki_rerun_match(address, 2, 1, &supplied))
+	if(m68ki_rerun_match(address, 2, 1, fc, &supplied))
 		return;                       /* software already ran this cycle */
 
 	m68ki_set_access(address, fc, 2, 1, value);
@@ -1376,7 +1399,7 @@ static inline void m68ki_write_32_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
-	if(m68ki_rerun_match(address, 4, 1, &supplied))
+	if(m68ki_rerun_match(address, 4, 1, fc, &supplied))
 		return;                       /* software already ran this cycle */
 
 	m68ki_set_access(address, fc, 4, 1, value);
@@ -1397,7 +1420,7 @@ static inline void m68ki_write_32_pd_fc(uint address, uint fc, uint value)
 	    address = pmmu_translate_addr(address);
 #endif
 
-	if(m68ki_rerun_match(address, 4, 1, &supplied))
+	if(m68ki_rerun_match(address, 4, 1, fc, &supplied))
 		return;                       /* software already ran this cycle */
 
 	m68ki_set_access(address, fc, 4, 1, value);
